@@ -103,7 +103,7 @@ We recommend organizing your data into a structured format first (e.g., using th
 }
 ```
 
-The example_messages.jsonl file is provided as an example, containing 128 random samples from the xlam50k dataset. Based on this structured data, the training data for CKD can be generated using the `teacher_rollout.py` script, while the training data for Sim-RL can be generated using the `messages_to_trainset.py` script:
+The example_messages.jsonl file is provided as an example, containing 1024 random samples from the xlam50k dataset. Based on this structured data, the training data for CKD can be generated using the `teacher_rollout.py` script, while the training data for Sim-RL can be generated using the `messages_to_trainset.py` script:
 
 CKD data:
 ```bash
