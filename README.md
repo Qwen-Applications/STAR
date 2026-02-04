@@ -26,7 +26,7 @@ This repository contains the code and instructions necessary to reproduce the ex
 # 🔥 News
 
 - **[2025.02.04]** We released the STAR codebase, including implementations for CKD and Sim-RL.
-- **[2025.02.04]** Our paper is now available on arXiv: [2504.13471](https://arxiv.org/abs/2602.03022).
+- **[2025.02.04]** Our paper is now available on arXiv: [2602.03022](https://arxiv.org/abs/2602.03022).
 - **[2026.01.26]** Our paper has been accepted to ICLR 2026!
 
 
