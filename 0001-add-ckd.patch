@@ -1,0 +1,1082 @@
+From ee738efc45e745673f5ff81c5b5108ee2c4123c9 Mon Sep 17 00:00:00 2001
+From: peter <peterghost86@gmail.com>
+Date: Wed, 28 Jan 2026 08:08:02 +0000
+Subject: [PATCH] add ckd
+
+---
+ openrlhf/cli/train_ppo_ray.py                 |  40 +++++
+ openrlhf/datasets/prompts_dataset.py          |  23 ++-
+ openrlhf/models/actor.py                      |  13 +-
+ openrlhf/models/ring_attn_utils.py            |   2 +-
+ openrlhf/trainer/ppo_trainer.py               | 103 ++++++++++--
+ .../trainer/ppo_utils/experience_maker.py     | 150 ++++++++++++++++--
+ openrlhf/trainer/ppo_utils/replay_buffer.py   |  11 +-
+ openrlhf/trainer/ray/launcher.py              |  69 ++++++++
+ openrlhf/trainer/ray/ppo_actor.py             | 139 +++++++++++++++-
+ openrlhf/trainer/ray/vllm_engine.py           |   5 +
+ openrlhf/utils/utils.py                       |   8 +-
+ requirements.txt                              |   1 +
+ 12 files changed, 525 insertions(+), 39 deletions(-)
+
+diff --git a/openrlhf/cli/train_ppo_ray.py b/openrlhf/cli/train_ppo_ray.py
+index 423bc03..9564a9b 100644
+--- a/openrlhf/cli/train_ppo_ray.py
++++ b/openrlhf/cli/train_ppo_ray.py
+@@ -9,6 +9,7 @@ from openrlhf.trainer.ray.launcher import (
+     RayActorGroup,
+     ReferenceModelActor,
+     RewardModelActor,
++    TeacherModelActor,
+ )
+ from openrlhf.trainer.ray.ppo_actor import PolicyModelActor
+ from openrlhf.trainer.ray.ppo_critic import CriticModelActor
+@@ -94,6 +95,18 @@ def train(args):
+             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
+         )
+ 
++    if args.teacher is None:
++        teacher_model = None
++    else:
++        teacher_model = RayActorGroup(
++            args.ref_num_nodes,
++            args.ref_num_gpus_per_node,
++            TeacherModelActor if args.token_level_kl else ReferenceModelActor,
++            pg=pg,
++            num_gpus_per_actor=0.2 if pg else 1,
++            duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
++        )
++
+     if not args.colocate_all_models:
+         pg = None
+ 
+@@ -147,6 +160,7 @@ def train(args):
+         critic_model,
+         reward_model,
+         ref_model,
++        teacher_model,
+         vllm_engines,
+         prompt_split=args.prompt_split,
+         eval_split=args.eval_split,
+@@ -165,6 +179,8 @@ def train(args):
+     refs = []
+     if ref_model is not None:
+         refs.extend(ref_model.async_init_model_from_pretrained(strategy, args.pretrain))
++    if teacher_model is not None:
++        refs.extend(teacher_model.async_init_model_from_pretrained(strategy, args.teacher))
+     refs.extend(actor_model.async_init_model_from_pretrained(strategy, args.pretrain, max_steps, vllm_engines))
+     if not args.remote_rm_url:
+         refs.extend(reward_model.async_init_model_from_pretrained(strategy, reward_pretrain))
+@@ -311,11 +327,13 @@ if __name__ == "__main__":
+     parser.add_argument(
+         "--vllm_generate_batch_size", type=int, default=None, help="Batch size for vLLM generating samples"
+     )
++    parser.add_argument("--off_policy_batch_size", type=int, default=None, help="Batch size for off policy samples")
+     parser.add_argument("--micro_rollout_batch_size", type=int, default=8)
+     parser.add_argument("--max_epochs", type=int, default=1)
+     parser.add_argument("--prompt_max_len", type=int, default=1024, help="Max tokens for each prompt")
+     parser.add_argument("--generate_max_len", type=int, default=1024, help="Max tokens to generate in PPO")
+     parser.add_argument("--max_len", type=int, default=None, help="deprecated max_len")
++    parser.add_argument("--max_steps", type=int, default=None, help="deprecated max_len")
+     parser.add_argument("--max_samples", type=int, default=1e8, help="Max number of samples")
+     parser.add_argument("--max_norm", type=float, default=1.0, help="Gradient clipping")
+     parser.add_argument("--l2", type=float, default=0.0, help="weight decay loss")
+@@ -350,6 +368,18 @@ if __name__ == "__main__":
+     parser.add_argument("--kl_target", type=float, default=None)
+     parser.add_argument("--kl_horizon", type=int, default=10000)
+     parser.add_argument("--init_kl_coef", type=float, default=0.01, help="KL penalty in PPO")
++    parser.add_argument("--kd_kl_coef", type=float, default=0.0, help="KD ratio in KD")
++    parser.add_argument("--kd_kl_l1_coef", type=float, default=0.0, help="KD L1 ratio in KD")
++    parser.add_argument("--kd_topk", type=int, default=100, help="KD TopK in KD")
++    parser.add_argument("--kd_student_topm", type=int, default=100, help="KD Student TopM in KD")
++    parser.add_argument("--kd_random_sample", action="store_true", default=False, help="Random-sample KD")
++    parser.add_argument("--kd_alter_impl", action="store_true", default=False, help="KD alter impl")
++    parser.add_argument("--op_kl_coef", type=float, default=0.0, help="KL ratio in On-policy KD")
++    parser.add_argument("--ppo_coef", type=float, default=1.0, help="PPO ratio")
++    parser.add_argument("--kd_ratio", type=float, default=1.0, help="KD ratio with regard to CE")
++    parser.add_argument("--kd_kl_type", type=str, default="akl", choices=["akl", "fkl", "rkl"])
++    parser.add_argument("--ref_mask_type", type=str, default="all", choices=["all", "answer", "think", "alter"])
++    parser.add_argument("--token_level_kl", action="store_true", default=False, help="Token-level kl")
+     parser.add_argument("--policy_loss_type", type=str, default="ppo", choices=["ppo", "gspo"])
+     parser.add_argument(
+         "--kl_estimator",
+@@ -403,6 +433,7 @@ if __name__ == "__main__":
+ 
+     #  Models
+     parser.add_argument("--pretrain", type=str, default=None, help="HF model name or path")
++    parser.add_argument("--teacher", type=str, default=None, help="HF model name or path")
+     parser.add_argument("--reward_pretrain", type=str, default=None, help="HF model name or path")
+     parser.add_argument("--remote_rm_url", type=str, default=None, help="remote RM API (HTTP)")
+     parser.add_argument("--critic_pretrain", type=str, default=None, help="HF model name or path")
+@@ -412,6 +443,7 @@ if __name__ == "__main__":
+ 
+     # Custom dataset
+     parser.add_argument("--prompt_data", type=str, default=None, help="HF dataset name or path")
++    parser.add_argument("--ref_prompt_data", type=str, default=None, help="HF dataset name or path")
+     parser.add_argument(
+         "--prompt_data_probs",
+         type=str,
+@@ -428,6 +460,7 @@ if __name__ == "__main__":
+ 
+     parser.add_argument("--input_key", type=str, default="input", help="JSON dataset key")
+     parser.add_argument("--label_key", type=str, default=None, help="JSON dataset key")
++    parser.add_argument("--ref_key", type=str, default=None, help="JSON dataset key")
+     parser.add_argument("--input_template", type=str, default=None)
+     parser.add_argument(
+         "--apply_chat_template", action="store_true", default=False, help="Use HF tokenizer chat template"
+@@ -450,6 +483,10 @@ if __name__ == "__main__":
+         "--dynamic_filtering_reward_range", nargs=2, default=(0, 1), type=float, help="Dynamic filtering rewards range"
+     )
+ 
++    parser.add_argument(
++        "--dynamic_filtering_min_diff", type=float, help="Max reward - Min reward should bigger than this value", default=-1
++    )
++
+     # TensorBoard parameters
+     parser.add_argument("--use_tensorboard", type=str, default=None, help="TensorBoard logging path")
+ 
+@@ -535,6 +572,9 @@ if __name__ == "__main__":
+     if not args.vllm_generate_batch_size:
+         args.vllm_generate_batch_size = args.rollout_batch_size
+ 
++    if not args.off_policy_batch_size:
++        args.off_policy_batch_size = args.rollout_batch_size * args.n_samples_per_prompt
++
+     if args.dynamic_filtering:
+         assert (
+             args.dynamic_filtering_reward_range[0] < args.dynamic_filtering_reward_range[1]
+diff --git a/openrlhf/datasets/prompts_dataset.py b/openrlhf/datasets/prompts_dataset.py
+index c4479e0..b1ec79e 100644
+--- a/openrlhf/datasets/prompts_dataset.py
++++ b/openrlhf/datasets/prompts_dataset.py
+@@ -2,7 +2,9 @@ from torch.utils.data import Dataset
+ from tqdm import tqdm
+ 
+ 
+-def preprocess_data(data, input_template=None, input_key="input", label_key=None, apply_chat_template=None) -> str:
++def preprocess_data(
++    data, input_template=None, input_key="input", label_key=None, ref_key=None, apply_chat_template=None
++) -> str:
+     if apply_chat_template:
+         chat = data[input_key]
+         if isinstance(chat, str):
+@@ -15,7 +17,8 @@ def preprocess_data(data, input_template=None, input_key="input", label_key=None
+ 
+     # for Reinforced Fine-tuning
+     label = "" if label_key is None else data[label_key]
+-    return prompt, label
++    ref = "" if ref_key is None else data[ref_key]
++    return prompt, label, ref
+ 
+ 
+ class PromptDataset(Dataset):
+@@ -34,6 +37,7 @@ class PromptDataset(Dataset):
+         tokenizer,
+         strategy,
+         input_template=None,
++        ref_as_label=False,
+     ) -> None:
+         super().__init__()
+         self.strategy = strategy
+@@ -43,18 +47,29 @@ class PromptDataset(Dataset):
+         self.input_template = input_template
+         input_key = getattr(self.strategy.args, "input_key", None)
+         label_key = getattr(self.strategy.args, "label_key", None)
++        ref_key = getattr(self.strategy.args, "ref_key", None)
+         apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
+ 
++        if ref_as_label:
++            label_key = ref_key
++            ref_key = None
++        else:
++            ref_key = None
++
+         if apply_chat_template:
+             apply_chat_template = self.tokenizer.apply_chat_template
+ 
+         self.prompts = []
+         self.labels = []
++        self.refs = []
+         self.datasources = []
+         for data in tqdm(dataset, desc="Preprocessing data", disable=not self.strategy.is_rank_0()):
+-            prompt, label = preprocess_data(data, input_template, input_key, label_key, apply_chat_template)
++            prompt, label, ref = preprocess_data(
++                data, input_template, input_key, label_key, ref_key, apply_chat_template
++            )
+             self.prompts.append(prompt)
+             self.labels.append(label)
++            self.refs.append(ref)
+             self.datasources.append(data.get("datasource", "default"))
+ 
+     def __len__(self):
+@@ -62,4 +77,4 @@ class PromptDataset(Dataset):
+         return length
+ 
+     def __getitem__(self, idx):
+-        return self.datasources[idx], self.prompts[idx], self.labels[idx]
++        return self.datasources[idx], self.prompts[idx], self.labels[idx], self.refs[idx]
+diff --git a/openrlhf/models/actor.py b/openrlhf/models/actor.py
+index 8acea50..fb4324c 100644
+--- a/openrlhf/models/actor.py
++++ b/openrlhf/models/actor.py
+@@ -141,6 +141,7 @@ class Actor(nn.Module):
+         ring_attn_group: Optional[dist.ProcessGroup] = None,
+         packed_seq_lens: Optional[list[int]] = None,
+         return_entropy=False,
++        return_full_logprobs=False,
+     ) -> torch.Tensor:
+         """Returns action log probs"""
+         batch, seqlen = sequences.size()
+@@ -168,7 +169,7 @@ class Actor(nn.Module):
+             setattr(output, "entropy", entropy[:, :-1])
+ 
+         return_action_log_probs = action_mask is not None
+-        if not return_action_log_probs and not return_logprobs:
++        if not return_action_log_probs and not return_logprobs and not return_full_logprobs:
+             assert return_output
+             if allgather_logits and self.packing_samples:
+                 output["logits"] = gather_and_pad_tensor(
+@@ -176,7 +177,10 @@ class Actor(nn.Module):
+                 )
+             return output
+ 
+-        log_probs = log_probs_from_logits(output["logits"], rolled_sequences, temperature=self.temperature)
++        if return_full_logprobs:
++            log_probs = output["logits"].log_softmax(-1)
++        else:
++            log_probs = log_probs_from_logits(output["logits"], rolled_sequences, temperature=self.temperature)
+ 
+         if self.packing_samples:
+             log_probs = gather_and_pad_tensor(log_probs, ring_attn_group, ring_attn_pad_len, indices, batch, seqlen)
+@@ -185,7 +189,10 @@ class Actor(nn.Module):
+         if not return_action_log_probs and return_logprobs:
+             return (log_probs, output) if return_output else log_probs
+ 
+-        action_log_probs = log_probs[:, -action_mask.shape[1] :] * action_mask.float()
++        if return_full_logprobs:
++            action_log_probs = log_probs[:, -action_mask.shape[1] :].squeeze(-2) * action_mask.float().unsqueeze(-1)
++        else:
++            action_log_probs = log_probs[:, -action_mask.shape[1] :] * action_mask.float()
+ 
+         return (action_log_probs, output) if return_output else action_log_probs
+ 
+diff --git a/openrlhf/models/ring_attn_utils.py b/openrlhf/models/ring_attn_utils.py
+index d9220a1..0546876 100644
+--- a/openrlhf/models/ring_attn_utils.py
++++ b/openrlhf/models/ring_attn_utils.py
+@@ -112,7 +112,7 @@ def unpad_and_slice_tensor(sequences, attention_mask, ring_attn_group):
+         tuple: Processed sequences and related tensors for ring attention
+     """
+     rolled_sequences = torch.roll(sequences, shifts=-1, dims=1)
+-    sequences, indices, cu_seqlens, _, _ = unpad_input(sequences.unsqueeze(-1), attention_mask)
++    sequences, indices, cu_seqlens = unpad_input(sequences.unsqueeze(-1), attention_mask)[:3]
+     sequences = sequences.transpose(0, 1)  # (1, total_seqs)
+     rolled_sequences = index_first_axis(
+         rearrange(rolled_sequences.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+diff --git a/openrlhf/trainer/ppo_trainer.py b/openrlhf/trainer/ppo_trainer.py
+index 41f50e8..681ccb5 100644
+--- a/openrlhf/trainer/ppo_trainer.py
++++ b/openrlhf/trainer/ppo_trainer.py
+@@ -29,6 +29,7 @@ class BasePPOTrainer(ABC):
+         critic_model_group: RayActorGroup,
+         reward_model_group: RayActorGroup,
+         reference_model_group: RayActorGroup,
++        teacher_model_group: RayActorGroup,
+         vllm_engines=None,
+         prompt_max_len: int = 120,
+         dataloader_pin_memory: bool = True,
+@@ -46,6 +47,7 @@ class BasePPOTrainer(ABC):
+         self.critic_model_group = critic_model_group
+         self.reward_model_group = reward_model_group
+         self.reference_model_group = reference_model_group
++        self.teacher_model_group = teacher_model_group
+         self.dataloader_pin_memory = dataloader_pin_memory
+         self.vllm_engines = vllm_engines
+ 
+@@ -329,6 +331,26 @@ class BasePPOTrainer(ABC):
+             True,
+         )
+ 
++        refs_dataloader = None
++        if args.ref_prompt_data is not None:
++            refs_data = blending_datasets(
++                args.ref_prompt_data,
++                None,
++                strategy,
++                args.seed,
++                max_count=args.max_samples,
++                dataset_split=self.prompt_split,
++            )
++            refs_dataset = PromptDataset(
++                refs_data, self.tokenizer, strategy, input_template=args.input_template, ref_as_label=True
++            )
++            refs_dataloader = strategy.setup_dataloader(
++                refs_dataset,
++                args.off_policy_batch_size,
++                True,
++                True,
++            )
++
+         # Create eval dataset if eval data exists
+         if getattr(args, "eval_dataset", None):
+             eval_data = blending_datasets(
+@@ -345,13 +367,28 @@ class BasePPOTrainer(ABC):
+ 
+         self.prompts_dataloader = prompts_dataloader
+         self.eval_dataloader = eval_dataloader
+-        self.max_steps = (
+-            len(prompts_dataset)
+-            * args.n_samples_per_prompt
+-            // args.train_batch_size
+-            * args.num_episodes
+-            * args.max_epochs
+-        )
++        self.refs_dataloader = refs_dataloader
++
++        if args.max_steps is not None:
++            if args.max_steps > 0:
++                self.max_steps = args.max_steps * args.n_samples_per_prompt * args.max_epochs
++            else:
++                self.max_steps = (
++                    len(prompts_dataset)
++                    * args.n_samples_per_prompt
++                    // args.train_batch_size
++                    * args.num_episodes
++                    * args.max_epochs
++                )
++                args.max_steps = len(prompts_dataset) // args.train_batch_size * args.num_episodes * args.max_epochs
++        else:
++            self.max_steps = (
++                len(prompts_dataset)
++                * args.n_samples_per_prompt
++                // args.train_batch_size
++                * args.num_episodes
++                * args.max_epochs
++            )
+ 
+     def get_max_steps(self):
+         return self.max_steps
+@@ -372,6 +409,7 @@ class PPOTrainer(BasePPOTrainer):
+         critic_model_group: RayActorGroup,
+         reward_model_group: RayActorGroup,
+         reference_model_group: RayActorGroup,
++        teacher_model_group: RayActorGroup,
+         vllm_engines=None,
+         prompt_max_len: int = 120,
+         dataloader_pin_memory: bool = True,
+@@ -386,6 +424,7 @@ class PPOTrainer(BasePPOTrainer):
+             critic_model_group,
+             reward_model_group,
+             reference_model_group,
++            teacher_model_group,
+             vllm_engines,
+             prompt_max_len,
+             dataloader_pin_memory,
+@@ -416,6 +455,7 @@ class PPOTrainer(BasePPOTrainer):
+             self.critic_model_group,
+             self.reward_model_group,
+             self.reference_model_group,
++            self.teacher_model_group,
+             self.kl_ctl,
+             self.strategy,
+             self.tokenizer,
+@@ -442,6 +482,7 @@ class PPOTrainer(BasePPOTrainer):
+             checkpoint_states = ray.get(self.actor_model_group.async_run_method(method_name="get_checkpoint_states"))[
+                 0
+             ]
++            checkpoint_states["episode"] = max(checkpoint_states["episode"] - 1, 0)
+             logger.info(f"checkpoint_states: {checkpoint_states}")
+             self._broadcast_to_vllm()
+         else:
+@@ -453,8 +494,16 @@ class PPOTrainer(BasePPOTrainer):
+         data_loader_state_dict = checkpoint_states["data_loader_state_dict"]
+         if data_loader_state_dict:
+             self.prompts_dataloader.load_state_dict(data_loader_state_dict)
++            self.refs_dataloader.load_state_dict(data_loader_state_dict)
++
++        while True:
++            if args.max_steps is None:
++                if episode >= args.num_episodes:
++                    break
++            else:
++                if steps - 1 >= args.max_steps:
++                    break
+ 
+-        for episode in range(episode, args.num_episodes):
+             pbar = tqdm(
+                 range(self.prompts_dataloader.__len__()),
+                 desc=f"Episode [{episode + 1}/{args.num_episodes}]",
+@@ -463,10 +512,31 @@ class PPOTrainer(BasePPOTrainer):
+ 
+             filtered_samples = []
+             number_of_samples = 0
+-            for _, rand_prompts, labels in self.prompts_dataloader:
++            if self.refs_dataloader is not None:
++                refs_dataloader = iter(self.refs_dataloader)
++            for _, rand_prompts, labels, _ in self.prompts_dataloader:
++                if self.refs_dataloader is not None:
++                    try:
++                        _, ref_prompts, refs, _ = next(refs_dataloader)
++                    except StopIteration:
++                        refs_dataloader = iter(self.refs_dataloader)
++                        _, ref_prompts, refs, _ = next(refs_dataloader)
++                else:
++                    ref_prompts = None
++                    refs = None
++
++                if args.max_steps is not None:
++                    if steps - 1 >= args.max_steps:
++                        break
++
+                 remote_reward_model = self.remote_reward_model if self.args.dynamic_filtering else None
+                 rollout_samples = self.samples_generator.generate_samples(
+-                    rand_prompts, labels, remote_reward_model=remote_reward_model, **self.generate_kwargs
++                    rand_prompts,
++                    labels,
++                    ref_prompts,
++                    refs,
++                    remote_reward_model=remote_reward_model,
++                    **self.generate_kwargs,
+                 )
+                 pbar.update()
+ 
+@@ -481,11 +551,17 @@ class PPOTrainer(BasePPOTrainer):
+                             continue
+ 
+                         # Calculate average reward for this batch of samples
+-                        avg_reward = sum(sample.scores[0].item() for sample in batch_samples) / len(batch_samples)
++                        scores = [sample.scores[0].item() for sample in batch_samples]
++                        avg_reward = sum(scores) / len(batch_samples)
++                        max_batch_reward = max(scores)
++                        min_batch_reward = min(scores)
++                        reward_diff = max_batch_reward - min_batch_reward
+ 
+-                        # Check if average reward is within the specified range
++                        # Check if average reward is within the specified range and reward_diff > min_diff
+                         min_reward, max_reward = self.args.dynamic_filtering_reward_range
+-                        if min_reward + 1e-6 < avg_reward < max_reward - 1e-6:
++                        min_diff = self.args.dynamic_filtering_min_diff
++                        
++                        if min_reward + 1e-6 < avg_reward < max_reward - 1e-6 and reward_diff > min_diff:
+                             filtered_samples.extend(batch_samples)
+ 
+                     # Continue sampling if filtered samples are insufficient
+@@ -540,6 +616,7 @@ class PPOTrainer(BasePPOTrainer):
+                 self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
+ 
+                 steps = steps + 1
++            episode += 1
+ 
+         if self._wandb is not None:
+             self._wandb.finish()
+diff --git a/openrlhf/trainer/ppo_utils/experience_maker.py b/openrlhf/trainer/ppo_utils/experience_maker.py
+index 2e528b4..f9a2e78 100644
+--- a/openrlhf/trainer/ppo_utils/experience_maker.py
++++ b/openrlhf/trainer/ppo_utils/experience_maker.py
+@@ -1,3 +1,6 @@
++import itertools
++import math
++import json
+ import time
+ from abc import ABC
+ from copy import deepcopy
+@@ -52,8 +55,14 @@ class Experience:
+     attention_mask: torch.LongTensor = None
+     action_mask: torch.BoolTensor = None
+ 
++    off_policy_sequences: torch.Tensor = None
++    off_policy_attention_mask: torch.LongTensor = None
++    off_policy_action_mask: torch.BoolTensor = None
++
+     action_log_probs: torch.Tensor = None
+     base_action_log_probs: torch.Tensor = None
++    teacher_ref_action_log_probs: torch.Tensor = None
++    teacher_ref_action_log_probs_ids: torch.Tensor = None
+     values: torch.Tensor = None
+     returns: torch.Tensor = None
+     advantages: torch.Tensor = None
+@@ -74,6 +83,11 @@ class Experience:
+         sequences=None,
+         action_log_probs=None,
+         base_action_log_probs=None,
++        off_policy_sequences=None,
++        off_policy_attention_mask=None,
++        off_policy_action_mask=None,
++        teacher_ref_action_log_probs=None,
++        teacher_ref_action_log_probs_ids=None,
+         values=None,
+         returns=None,
+         advantages=None,
+@@ -90,6 +104,11 @@ class Experience:
+         self.sequences = sequences
+         self.action_log_probs = action_log_probs
+         self.base_action_log_probs = base_action_log_probs
++        self.off_policy_sequences = off_policy_sequences
++        self.off_policy_attention_mask = off_policy_attention_mask
++        self.off_policy_action_mask = off_policy_action_mask
++        self.teacher_ref_action_log_probs = teacher_ref_action_log_probs
++        self.teacher_ref_action_log_probs_ids = teacher_ref_action_log_probs_ids
+         self.values = values
+         self.returns = returns
+         self.advantages = advantages
+@@ -250,7 +269,9 @@ class SamplesGenerator:
+         self.prompt_max_len = prompt_max_len
+ 
+     @torch.no_grad()
+-    def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Experience]:
++    def generate_samples(
++        self, all_prompts: List[str], all_labels, all_ref_prompts, all_refs, **generate_kwargs
++    ) -> List[Experience]:
+         """
+         Generate samples and return in batches.
+ 
+@@ -263,7 +284,7 @@ class SamplesGenerator:
+ 
+             batch_vllm_engine_call(self.vllm_engines, "wake_up")
+ 
+-        rollout_samples = self._generate_vllm(all_prompts, all_labels, **generate_kwargs)
++        rollout_samples = self._generate_vllm(all_prompts, all_labels, all_ref_prompts, all_refs, **generate_kwargs)
+ 
+         # vLLM offload when vllm_enable_sleep
+         if self.strategy.args.vllm_enable_sleep:
+@@ -292,7 +313,9 @@ class SamplesGenerator:
+         )
+         return {k: v.to(device) for k, v in batch.items()}
+ 
+-    def _generate_vllm(self, all_prompts: List[str], all_labels, **kwargs) -> List[Experience]:
++    def _generate_vllm(
++        self, all_prompts: List[str], all_labels, all_ref_prompts, all_refs, **kwargs
++    ) -> List[Experience]:
+         """Generate samples using vLLM engine.
+ 
+         Args:
+@@ -326,6 +349,12 @@ class SamplesGenerator:
+         all_prompts = sum([[prompt] * n_samples_per_prompt for prompt in all_prompts], [])
+         all_labels = sum([[label] * n_samples_per_prompt for label in all_labels], [])
+         all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
++        if all_ref_prompts is not None:
++            all_ref_prompts_token_ids = self.tokenize_fn(all_ref_prompts, self.prompt_max_len, padding=False)[
++                "input_ids"
++            ]
++        if all_refs is not None:
++            all_ref_token_ids = self.tokenize_fn(all_refs, max_response_length, padding=False)["input_ids"]
+ 
+         # Distribute requests to engines and collect responses
+         refs = []
+@@ -376,14 +405,61 @@ class SamplesGenerator:
+                 "response_clip_ratio": torch.tensor([is_clipped]),
+             }
+ 
+-            rollout_samples = Experience(
+-                sequences=sequences.unsqueeze(0),
+-                attention_mask=attention_mask.unsqueeze(0),
+-                action_mask=action_mask.unsqueeze(0),
+-                prompts=[prompt],
+-                labels=[label],
+-                info=info,
+-            )
++            if all_ref_prompts is not None and all_refs is not None:
++                ref_input_ids = list(all_ref_prompts_token_ids[i]) + list(all_ref_token_ids[i])
++                if all_ref_token_ids[i][-1] != eos_token_id:
++                    ref_input_ids.append(eos_token_id)
++                ref_attention_mask = [1] * len(ref_input_ids)
++
++                ref_sequences = torch.tensor(ref_input_ids)
++                ref_attention_mask = torch.tensor(ref_attention_mask)
++
++                ref_action_mask = torch.zeros_like(ref_attention_mask)
++                if args.ref_mask_type == "all":
++                    ref_response_length = len(all_ref_token_ids[i]) + int(all_ref_token_ids[i][-1] != eos_token_id)
++                    ref_action_mask[
++                        len(all_ref_prompts_token_ids[i]) : len(all_ref_prompts_token_ids[i]) + ref_response_length
++                    ] = 1
++                elif args.ref_mask_type == "think" or (args.ref_mask_type == "alter" and i % 2 == 0):
++                    think_end = max(j for j, v in enumerate(all_ref_token_ids[i]) if v == 151668)
++                    ref_action_mask[
++                        len(all_ref_prompts_token_ids[i]) : len(all_ref_prompts_token_ids[i]) + think_end + 1
++                    ] = 1
++                elif args.ref_mask_type == "answer" or (args.ref_mask_type == "alter" and i % 2 == 1):
++                    think_end = max(j for j, v in enumerate(all_ref_token_ids[i]) if v == 151668)
++                    ref_response_length = len(all_ref_token_ids[i]) + int(all_ref_token_ids[i][-1] != eos_token_id)
++                    ref_action_mask[
++                        len(all_ref_prompts_token_ids[i])
++                        + think_end
++                        + 1 : len(all_ref_prompts_token_ids[i])
++                        + ref_response_length
++                    ] = 1
++
++                ref_sequences = ref_sequences[:truncate_length].to("cpu")
++                ref_attention_mask = ref_attention_mask[:truncate_length].to("cpu")
++                ref_action_mask = ref_action_mask[1:truncate_length].to("cpu")
++
++                rollout_samples = Experience(
++                    sequences=sequences.unsqueeze(0),
++                    attention_mask=attention_mask.unsqueeze(0),
++                    action_mask=action_mask.unsqueeze(0),
++                    off_policy_sequences=ref_sequences.unsqueeze(0),
++                    off_policy_attention_mask=ref_attention_mask.unsqueeze(0),
++                    off_policy_action_mask=ref_action_mask.unsqueeze(0),
++                    prompts=[prompt],
++                    labels=[label],
++                    info=info,
++                )
++            else:
++                rollout_samples = Experience(
++                    sequences=sequences.unsqueeze(0),
++                    attention_mask=attention_mask.unsqueeze(0),
++                    action_mask=action_mask.unsqueeze(0),
++                    prompts=[prompt],
++                    labels=[label],
++                    info=info,
++                )
++
+             samples_list.append(rollout_samples)
+ 
+         # Get rewards from remote reward models if needed
+@@ -417,6 +493,7 @@ class RemoteExperienceMaker(ABC):
+         critic_model_group: RayActorGroup,
+         reward_model_group: RayActorGroup,
+         initial_model_group: RayActorGroup,
++        teacher_model_group: RayActorGroup,
+         kl_controller,
+         strategy=None,
+         tokenizer=None,
+@@ -429,6 +506,7 @@ class RemoteExperienceMaker(ABC):
+         self.critic_model_group = critic_model_group
+         self.reward_model_group = reward_model_group
+         self.initial_model_group = initial_model_group
++        self.teacher_model_group = teacher_model_group
+         self.kl_ctl = kl_controller
+         self.strategy = strategy
+         self.advantage_estimator = strategy.args.advantage_estimator
+@@ -510,6 +588,11 @@ class RemoteExperienceMaker(ABC):
+         attention_mask_list = [s.attention_mask for s in samples_list]
+         action_mask_list = [s.action_mask for s in samples_list]
+ 
++        if args.ref_prompt_data is not None:
++            off_policy_sequences_list = [s.off_policy_sequences for s in samples_list]
++            off_policy_attention_mask_list = [s.off_policy_attention_mask for s in samples_list]
++            off_policy_action_mask_list = [s.off_policy_action_mask for s in samples_list]
++
+         # The rewards are already filled in the samples_list, such as the agent's environment rewards
+         if samples_list[0].rewards is not None:
+             pass
+@@ -582,11 +665,39 @@ class RemoteExperienceMaker(ABC):
+             if args.colocate_all_models or args.colocate_actor_ref:
+                 ray.get(base_action_log_probs_ref)
+                 ray.get(self.initial_model_group.async_run_method(method_name="empty_cache"))
++        elif self.teacher_model_group is not None and args.op_kl_coef > 0:
++            base_action_log_probs_ref = self.teacher_model_group.async_run_method_batch(
++                method_name="forward",
++                sequences=sequences_list,
++                action_mask=action_mask_list,
++                attention_mask=attention_mask_list,
++                return_full_logprobs=[False] * len(samples_list),
++            )
++
++            if args.colocate_all_models or args.colocate_actor_ref:
++                ray.get(base_action_log_probs_ref)
+         else:
+             base_action_log_probs_ref = ray.put(
+                 [[None]] * (len(samples_list) * args.ring_attn_size * args.ds_tensor_parallel_size)
+             )
+ 
++        # Batch call teacher model on off-policy samples
++        if self.teacher_model_group is not None:
++            teacher_ref_action_log_probs = self.teacher_model_group.async_run_method_batch(
++                method_name="forward",
++                sequences=off_policy_sequences_list,
++                action_mask=off_policy_action_mask_list,
++                attention_mask=off_policy_attention_mask_list,
++            )
++
++            if args.colocate_all_models or args.colocate_actor_ref:
++                ray.get(teacher_ref_action_log_probs)
++                ray.get(self.teacher_model_group.async_run_method(method_name="empty_cache"))
++        else:
++            teacher_ref_action_log_probs = ray.put(
++                [[None]] * (len(samples_list) * args.ring_attn_size * args.ds_tensor_parallel_size)
++            )
++
+         # Wait for all remote calls to complete and flatten the results
+         # Note: the results duplicated ring_attn_size * ds_tensor_parallel_size times
+         # This is because the actors in ring group and tp group will return the same output
+@@ -594,6 +705,7 @@ class RemoteExperienceMaker(ABC):
+         action_log_probs_list = sum(ray.get(action_log_probs_ref)[::duplicate_factor], [])
+         base_action_log_probs_list = sum(ray.get(base_action_log_probs_ref)[::duplicate_factor], [])
+         value_list = sum(ray.get(value_ref)[::duplicate_factor], [])
++        teacher_ref_action_log_probs_list = sum(ray.get(teacher_ref_action_log_probs)[::duplicate_factor], [])
+ 
+         # Process rewards based on source
+         if samples_list[0].rewards is not None:
+@@ -615,8 +727,14 @@ class RemoteExperienceMaker(ABC):
+         ), f"len(samples_list): {len(samples_list)}, len(action_log_probs_list): {len(action_log_probs_list)}, len(base_action_log_probs_list): {len(base_action_log_probs_list)}, len(value_list): {len(value_list)}"
+ 
+         # Process results for each sample
+-        for i, (samples, action_log_probs, base_action_log_probs, value) in enumerate(
+-            zip(samples_list, action_log_probs_list, base_action_log_probs_list, value_list)
++        for i, (samples, action_log_probs, base_action_log_probs, value, teacher_ref_action_log_probs) in enumerate(
++            zip(
++                samples_list,
++                action_log_probs_list,
++                base_action_log_probs_list,
++                value_list,
++                teacher_ref_action_log_probs_list,
++            )
+         ):
+             if (self.initial_model_group is not None) and (not args.use_kl_loss):
+                 kl = compute_approx_kl(
+@@ -634,6 +752,12 @@ class RemoteExperienceMaker(ABC):
+             # Update experience with new information
+             samples.action_log_probs = action_log_probs
+             samples.base_action_log_probs = base_action_log_probs
++            if args.token_level_kl:
++                samples.teacher_ref_action_log_probs, samples.teacher_ref_action_log_probs_ids = (
++                    teacher_ref_action_log_probs
++                )
++            else:
++                samples.teacher_ref_action_log_probs = teacher_ref_action_log_probs
+             samples.values = value
+             samples.kl = kl
+             samples.info["kl"] = kl_mean
+diff --git a/openrlhf/trainer/ppo_utils/replay_buffer.py b/openrlhf/trainer/ppo_utils/replay_buffer.py
+index 76f9b83..7d7fe0d 100644
+--- a/openrlhf/trainer/ppo_utils/replay_buffer.py
++++ b/openrlhf/trainer/ppo_utils/replay_buffer.py
+@@ -36,6 +36,11 @@ class BufferItem:
+     advantages: torch.Tensor
+     attention_mask: Optional[torch.LongTensor]
+     action_mask: Optional[torch.BoolTensor]
++    off_policy_sequences: torch.Tensor
++    off_policy_attention_mask: Optional[torch.LongTensor]
++    off_policy_action_mask: Optional[torch.BoolTensor]
++    teacher_ref_action_log_probs: torch.Tensor
++    teacher_ref_action_log_probs_ids: torch.Tensor
+     info: Optional[dict]
+ 
+ 
+@@ -85,7 +90,11 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
+     # Process main attributes
+     kwargs = {
+         key: (
+-            zero_pad_sequences([getattr(item, key) for item in items], "right", stack=True)
++            (
++                zero_pad_sequences([getattr(item, key) for item in items], "right", stack=True)
++                if not key.startswith("teacher_ref_") or getattr(items[0], "teacher_ref_action_log_probs_ids") is None
++                else zero_pad_sequences([getattr(item, key) for item in items], "right", stack=True, dim=-2)
++            )
+             if getattr(items[0], key) is not None
+             else None
+         )
+diff --git a/openrlhf/trainer/ray/launcher.py b/openrlhf/trainer/ray/launcher.py
+index 2debf78..f6d204a 100644
+--- a/openrlhf/trainer/ray/launcher.py
++++ b/openrlhf/trainer/ray/launcher.py
+@@ -143,6 +143,75 @@ class ReferenceModelActor(BaseModelActor):
+         return log_probs.to("cpu")
+ 
+ 
++@ray.remote(num_gpus=1)
++class TeacherModelActor(BaseModelActor):
++    def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
++        self._setup_distributed(strategy)
++        model = Actor(
++            pretrain,
++            use_flash_attention_2=strategy.args.flash_attn,
++            bf16=strategy.args.bf16,
++            load_in_4bit=strategy.args.load_in_4bit,
++            ds_config=strategy.get_ds_eval_config(offload=strategy.args.ref_reward_offload),
++            packing_samples=strategy.args.packing_samples,
++            temperature=strategy.args.temperature,
++            use_liger_kernel=strategy.args.use_liger_kernel,
++        )
++        strategy.print(model)
++
++        if strategy.args.ref_reward_offload:
++            model._offload = True
++
++        self.model = self.strategy.prepare(model, is_rlhf=True)
++        self.model.eval()
++
++        self.top_k = strategy.args.kd_topk
++        self.random_sample = strategy.args.kd_random_sample
++
++    def forward(
++        self,
++        sequences: torch.LongTensor,
++        action_mask: Optional[torch.Tensor] = None,
++        attention_mask: Optional[torch.Tensor] = None,
++        return_output=False,
++        packed_seq_lens: Optional[list[int]] = None,
++        return_full_logprobs=True,
++    ) -> torch.Tensor:
++        device = torch.cuda.current_device()
++        with torch.no_grad():
++            log_probs = self.model(
++                sequences.to(device),
++                action_mask.to(device),
++                attention_mask.to(device),
++                ring_attn_group=self.strategy.ring_attn_group,
++                packed_seq_lens=packed_seq_lens,
++                return_full_logprobs=return_full_logprobs,
++            )
++
++            if self.random_sample:
++                vocab_size = log_probs.shape[-1]
++                true_probs = log_probs.exp().view(-1, vocab_size)
++                indices = torch.multinomial(true_probs, num_samples=self.top_k, replacement=True).view(
++                    *log_probs.shape[:-1], -1
++                )
++
++                prob_value = 1.0 / self.top_k
++                values = torch.full(
++                    (*log_probs.shape[:-1], self.top_k), prob_value, device=log_probs.device, dtype=log_probs.dtype
++                )
++
++                sampled_probs = torch.zeros_like(log_probs)
++                sampled_probs.scatter_add_(-1, indices, values)
++
++                log_probs = torch.log(sampled_probs)
++
++            if return_full_logprobs:
++                topk_vals, topk_ids = log_probs.topk(self.top_k)
++                return topk_vals.to("cpu"), topk_ids.to("cpu")
++            else:
++                return log_probs.to("cpu")
++
++
+ @ray.remote(num_gpus=1)
+ class RewardModelActor(BaseModelActor):
+     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
+diff --git a/openrlhf/trainer/ray/ppo_actor.py b/openrlhf/trainer/ray/ppo_actor.py
+index 4d10e7e..bfec1da 100644
+--- a/openrlhf/trainer/ray/ppo_actor.py
++++ b/openrlhf/trainer/ray/ppo_actor.py
+@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Union
+ import deepspeed
+ import ray
+ import torch
++import torch.nn
++import torch.nn.functional as F
+ import torch.distributed
+ from torch.optim import Optimizer
+ from torch.utils.data import DataLoader
+@@ -220,6 +222,11 @@ class ActorPPOTrainer(ABC):
+         old_action_log_probs = experience.action_log_probs
+         advantages = experience.advantages
+         base_action_log_probs = experience.base_action_log_probs
++        off_policy_sequences = experience.off_policy_sequences
++        off_policy_attention_mask = experience.off_policy_attention_mask
++        off_policy_action_mask = experience.off_policy_action_mask
++        teacher_ref_action_log_probs = experience.teacher_ref_action_log_probs
++        teacher_ref_action_log_probs_ids = experience.teacher_ref_action_log_probs_ids
+ 
+         # actor loss
+         action_log_probs, output = self.actor(
+@@ -232,6 +239,17 @@ class ActorPPOTrainer(ABC):
+             return_entropy=self.args.entropy_loss_coef is not None,
+         )
+ 
++        # actor loss
++        if self.args.ref_prompt_data is not None:
++            policy_ref_action_log_probs = self.actor(
++                off_policy_sequences,
++                off_policy_action_mask,
++                attention_mask=off_policy_attention_mask,
++                ring_attn_group=self.strategy.ring_attn_group,
++                packed_seq_lens=packed_seq_lens,
++                return_full_logprobs=self.args.token_level_kl,
++            )
++
+         # loss function
+         actor_loss, clip_ratio, ppo_kl = self.actor_loss_fn(
+             action_log_probs,
+@@ -256,7 +274,126 @@ class ActorPPOTrainer(ABC):
+         else:
+             kl_loss = 0
+ 
+-        loss = actor_loss + kl_loss * kl_ctl
++        if self.args.use_kl_loss:
++            if self.args.op_kl_coef > 0:
++                op_kl = compute_approx_kl(
++                    action_log_probs,
++                    base_action_log_probs,
++                    kl_estimator=self.args.kl_estimator,
++                )
++            else:
++                op_kl = torch.zeros_like(
++                    action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device
++                )
++            op_kl_loss = masked_mean(op_kl, experience.action_mask)
++            experience.info["op_kl"] = op_kl_loss.detach()
++        else:
++            op_kl_loss = 0
++
++        if self.args.use_kl_loss and self.args.ref_prompt_data is not None:
++            if self.args.kd_kl_coef > 0:
++                if self.args.token_level_kl:
++                    if self.args.kd_alter_impl:
++                        with torch.no_grad():
++                            teacher_probs_topk_vals = teacher_ref_action_log_probs.exp()
++                            teacher_probs_topk_idx = teacher_ref_action_log_probs_ids
++
++                            teacher_probs = torch.zeros_like(policy_ref_action_log_probs)
++                            teacher_probs.scatter_(-1, teacher_probs_topk_idx, teacher_probs_topk_vals)
++
++                        kd_kl = F.kl_div(
++                            policy_ref_action_log_probs,
++                            teacher_probs,
++                            reduction="none",
++                            log_target=False,
++                        ).sum(dim=-1)
++                    else:
++                        teacher_logps_topk_idx = teacher_ref_action_log_probs_ids
++                        teacher_logps_topk_vals = teacher_ref_action_log_probs
++                        teacher_probs_topk_vals = torch.exp(teacher_logps_topk_vals)
++
++                        student_logps_topk_vals = policy_ref_action_log_probs.gather(-1, teacher_logps_topk_idx)
++                        student_probs_topk_vals = torch.exp(student_logps_topk_vals)
++
++                        f_kl = (teacher_probs_topk_vals * (teacher_logps_topk_vals - student_logps_topk_vals)).sum(-1)
++                        r_kl = (student_probs_topk_vals * (student_logps_topk_vals - teacher_logps_topk_vals)).sum(-1)
++
++                        if self.args.kd_kl_type == "fkl":
++                            kd_kl = f_kl
++                        elif self.args.kd_kl_type == "rkl":
++                            kd_kl = r_kl
++                        else:
++                            g_thres = 0.5
++
++                            g_mask = torch.roll(teacher_probs_topk_vals.cumsum(-1) < g_thres, 1, -1)
++                            g_mask[..., 0] = True
++                            g_margin = (teacher_probs_topk_vals - student_probs_topk_vals).abs()
++
++                            g_head = (g_mask.float() * g_margin).sum(-1)
++                            g_tail = ((~g_mask).float() * g_margin).sum(-1)
++
++                            kd_kl_sum = g_head * f_kl + g_tail * r_kl
++                            kd_kl_num = g_head + g_tail
++                            nonzero_mask = kd_kl_num != 0
++                            kd_kl_num = kd_kl_num.masked_fill(~nonzero_mask, 1e-9)
++                            kd_kl = kd_kl_sum / kd_kl_num
++
++                        if self.args.kd_kl_l1_coef > 0:
++                            student_logps_topk_vals, student_logps_topk_idx = policy_ref_action_log_probs.topk(
++                                self.args.kd_student_topm
++                            )
++
++                            student_idx_expanded = student_logps_topk_idx.unsqueeze(-1)
++                            teacher_idx_expanded = teacher_logps_topk_idx.unsqueeze(-2)
++
++                            matches = student_idx_expanded == teacher_idx_expanded
++                            is_in_teacher_topk = matches.any(dim=-1)
++                            is_mistake_mask = ~is_in_teacher_topk
++                            mistake_prob_sum = (is_mistake_mask * student_logps_topk_vals.exp()).sum(-1)
++
++                            mistake_loss = mistake_prob_sum
++                            kd_kl = kd_kl + self.args.kd_kl_l1_coef * mistake_loss
++
++                    if self.args.kd_ratio < 1:
++                        rolled_sequences = torch.roll(off_policy_sequences, shifts=-1, dims=1)
++                        rolled_sequences = rolled_sequences[:, :-1]
++                        rolled_sequences = rolled_sequences[:, -experience.off_policy_action_mask.shape[1] :]
++
++                        ce = -policy_ref_action_log_probs.gather(-1, rolled_sequences.unsqueeze(-1)).squeeze(-1)
++                        kd_kl = self.args.kd_ratio * kd_kl + (1 - self.args.kd_ratio) * ce
++                else:
++                    if self.args.kd_ratio > 0:
++                        kd_kl = compute_approx_kl(
++                            policy_ref_action_log_probs,
++                            teacher_ref_action_log_probs,
++                            kl_estimator=self.args.kl_estimator,
++                        )
++                    else:
++                        kd_kl = -policy_ref_action_log_probs
++            else:
++                if self.args.token_level_kl:
++                    kd_kl = torch.zeros_like(
++                        policy_ref_action_log_probs[..., 0],
++                        dtype=policy_ref_action_log_probs.dtype,
++                        device=policy_ref_action_log_probs.device,
++                    )
++                else:
++                    kd_kl = torch.zeros_like(
++                        policy_ref_action_log_probs,
++                        dtype=policy_ref_action_log_probs.dtype,
++                        device=policy_ref_action_log_probs.device,
++                    )
++            kd_kl_loss = masked_mean(kd_kl, experience.off_policy_action_mask)
++            experience.info["kd_kl"] = kd_kl_loss.detach()
++        else:
++            kd_kl_loss = 0
++
++        loss = (
++            self.args.ppo_coef * actor_loss
++            + kl_loss * kl_ctl
++            + kd_kl_loss * self.args.kd_kl_coef
++            + op_kl_loss * self.args.op_kl_coef
++        )
+         # mixtral
+         if self.aux_loss:
+             loss += output.aux_loss * self.args.aux_loss_coef
+diff --git a/openrlhf/trainer/ray/vllm_engine.py b/openrlhf/trainer/ray/vllm_engine.py
+index 9ad51f8..a837708 100644
+--- a/openrlhf/trainer/ray/vllm_engine.py
++++ b/openrlhf/trainer/ray/vllm_engine.py
+@@ -155,6 +155,10 @@ def create_vllm_engines(
+             placement_group_bundle_index=bundle_indices[0] if bundle_indices else i,
+         )
+ 
++        additional_args = {}
++        if version.parse(vllm.__version__) >= version.parse("0.8.2"):
++            additional_args["generation_config"] = "vllm"
++
+         vllm_engines.append(
+             llm_actor_cls.options(
+                 num_cpus=num_gpus,
+@@ -177,6 +181,7 @@ def create_vllm_engines(
+                 num_gpus=0.2 if use_hybrid_engine else 1,
+                 enable_sleep_mode=vllm_enable_sleep,
+                 agent_func_path=agent_func_path,
++                **additional_args,
+             )
+         )
+ 
+diff --git a/openrlhf/utils/utils.py b/openrlhf/utils/utils.py
+index 895e7c6..7156168 100644
+--- a/openrlhf/utils/utils.py
++++ b/openrlhf/utils/utils.py
+@@ -45,14 +45,16 @@ def convert_token_to_id(token, tokenizer):
+ 
+ 
+ def zero_pad_sequences(
+-    sequences: List[torch.Tensor], side: str = "left", value: int = 0, stack: bool = False
++    sequences: List[torch.Tensor], side: str = "left", value: int = 0, stack: bool = False, dim: int = -1
+ ) -> torch.Tensor:
+     assert side in ("left", "right")
+-    max_len = max(seq.size(-1) for seq in sequences)
++    max_len = max(seq.size(dim) for seq in sequences)
+     padded_sequences = []
+     for seq in sequences:
+-        pad_len = max_len - seq.size(-1)
++        pad_len = max_len - seq.size(dim)
+         padding = (pad_len, 0) if side == "left" else (0, pad_len)
++        if dim == -2:
++            padding = (0, 0) + padding
+         padded_sequences.append(F.pad(seq, padding, value=value))
+     if stack:
+         return torch.stack(padded_sequences, dim=0)
+diff --git a/requirements.txt b/requirements.txt
+index a44d72f..07c4646 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -14,6 +14,7 @@ packaging
+ peft
+ pynvml>=12.0.0
+ ray[default]==2.48.0
++rouge_score
+ tensorboard
+ torch
+ torchdata
+-- 
+2.34.1
+
