@@ -6,7 +6,6 @@
      alt="Github"></a> 
   <a href='https://arxiv.org/abs/2602.03022'><img src='https://img.shields.io/badge/Paper-arXiv-red?style=for-the-badge&logo=arxiv' alt='arXiv PDF'></a>
   <a href='https://huggingface.co/star-lab'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Models-0984e3?style=for-the-badge'></a>
-  <a href='https://huggingface.co/star-lab'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Datasets-00b894?style=for-the-badge'></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-green.svg?style=for-the-badge" alt="License"></a>
 </p>
 
