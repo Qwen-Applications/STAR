@@ -102,7 +102,6 @@ def check_tool_calls_valid(tool_calls: List[Dict[str, Any]], tool_dict: Dict[str
 
 
 def get_rouge_score(p_value: str, gt_value: str) -> float:
-
     if p_value == gt_value:
         return 1
     if gt_value.strip() == "" or p_value.strip() == "":
@@ -228,6 +227,7 @@ def reward_func(queries, prompts, labels, print_info=True) -> tuple[torch.Tensor
         except Exception as e:
 
             print("[ERROR] answer format error: ")
+            
             scores.append(-1)
             format_scores.append(-1)
             answer_scores.append(0)
@@ -239,12 +239,14 @@ def reward_func(queries, prompts, labels, print_info=True) -> tuple[torch.Tensor
         try:
             if not check_tool_calls_valid(p_tool_call_objs, tool_dict):
                 print("[ERROR] tool calls are invalid: ", generation)
+                
                 scores.append(-1)
                 format_scores.append(-1)
                 answer_scores.append(0)
                 continue
         except Exception as e:
             print("[ERROR] tool calls are invalid: ", generation)
+            
             scores.append(-1)
             format_scores.append(-1)
             answer_scores.append(0)
