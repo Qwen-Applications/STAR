@@ -109,8 +109,8 @@ For demonstration purposes, we provide example_messages.jsonl, a file containing
 The comprehensive datasets for SimRL training can be prepared by executing the scripts/prepare_rl_data.sh script, which will automate the download and preprocessing of the ToolMind, XLAM, ToolAce, and Hammer datasets.
 
 > **Notes:**
-> ToolMind Dataset: Please note that the Tool-use-synthetic dataset is no longer publicly available and has been substituted in this work with the [Toolmind](https://huggingface.co/datasets/Nanbeige/ToolMind) dataset.
-> XLAM Dataset Access: Access to the XLAM dataset is restricted and requires authorization. You can request access [here](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k). Upon approval, a personal Hugging Face access token must be configured as an environment variable (HF_TOKEN) prior to script execution:
+> 1. ToolMind Dataset: Please note that the Tool-use-synthetic dataset is no longer publicly available and has been substituted in this work with the [Toolmind](https://huggingface.co/datasets/Nanbeige/ToolMind) dataset.
+> 2. XLAM Dataset Access: Access to the XLAM dataset is restricted and requires authorization. You can request access [here](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k). Upon approval, a personal Hugging Face access token must be configured as an environment variable (HF_TOKEN) prior to script execution:
 > ```bash
 > export HF_TOKEN="your_token_here"
 > bash scripts/prepare_rl_data.sh
