@@ -102,19 +102,33 @@ We recommend organizing your data into a structured format first (e.g., using th
 }
 ```
 
-The example_messages.jsonl file is provided as an example, containing 1024 random samples from the xlam50k dataset. Based on this structured data, the training data for CKD can be generated using the `teacher_rollout.py` script, while the training data for Sim-RL can be generated using the `messages_to_trainset.py` script:
+For demonstration purposes, we provide example_messages.jsonl, a file containing 128 instances randomly sampled from the XLAM dataset.
 
-CKD data:
+**SimRL Datasets:**
+
+The comprehensive datasets for SimRL training can be prepared by executing the scripts/prepare_rl_data.sh script, which will automate the download and preprocessing of the ToolMind, XLAM, ToolAce, and Hammer datasets.
+
+> **Notes:**
+> ToolMind Dataset: Please note that the Tool-use-synthetic dataset is no longer publicly available and has been substituted in this work with the [Toolmind](https://huggingface.co/datasets/Nanbeige/ToolMind) dataset.
+> XLAM Dataset Access: Access to the XLAM dataset is restricted and requires authorization. You can request access [here](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k). Upon approval, a personal Hugging Face access token must be configured as an environment variable (HF_TOKEN) prior to script execution:
+> ```bash
+> export HF_TOKEN="your_token_here"
+> bash scripts/prepare_rl_data.sh
+> ```
+
+**CKD Datasets:**
+
+The dataset for CKD is generated via a two-stage process. First, we perform rollouts with the teacher model (Teacher-8B) to generate synthetic trajectories from a set of seed messages. Second, these trajectories are converted into a structured training format, incorporating the teacher's reasoning chains. These steps are executed as follows:
+
 ```bash
-python teacher_rollout.py --input=example_messages.jsonl --output=kd_messages.jsonl --model-path ./models/Teacher-8B --rollout-n 8 --dp-size 8 
+# 1. Generate synthetic trajectories via teacher model rollouts
+python teacher_rollout.py --input=example_messages.jsonl --output=kd_messages.jsonl --model-path ./models/Teacher-8B --rollout-n 8 --dp-size 8
 
+# 2. Convert trajectories to a structured training set with reasoning
 python messages_to_trainset.py --input=kd_messages.jsonl --output=kd_data.jsonl --tokenizer-path=./models/Teacher-8B --add-reasoning-content
 ```
 
-SimRL data:
-```bash
-python messages_to_trainset.py --input=example_messages.jsonl --output=rl_data.jsonl --tokenizer-path=./models/Teacher-8B
-```
+
 
 ## Training: The STAR Curriculum
 
