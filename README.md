@@ -23,7 +23,7 @@ This repository contains the code and instructions necessary to reproduce the ex
 
 
 # 🔥 News
-
+- **[2026.03.20]** We released the scripts for data processing and dataset preparation.
 - **[2026.02.04]** We released the STAR codebase, including implementations for CKD and Sim-RL.
 - **[2026.02.04]** Our paper is now available on arXiv: [2602.03022](https://arxiv.org/abs/2602.03022).
 - **[2026.01.26]** Our paper has been accepted to ICLR 2026!
@@ -122,10 +122,10 @@ The dataset for CKD is generated via a two-stage process. First, we perform roll
 
 ```bash
 # 1. Generate synthetic trajectories via teacher model rollouts
-python teacher_rollout.py --input=example_messages.jsonl --output=kd_messages.jsonl --model-path ./models/Teacher-8B --rollout-n 8 --dp-size 8
+python data_process/teacher_rollout.py --input=example_messages.jsonl --output=kd_messages.jsonl --model-path ./models/Teacher-8B --rollout-n 8 --dp-size 8
 
 # 2. Convert trajectories to a structured training set with reasoning
-python messages_to_trainset.py --input=kd_messages.jsonl --output=kd_data.jsonl --tokenizer-path=./models/Teacher-8B --add-reasoning-content
+python data_process/messages_to_trainset.py --input=kd_messages.jsonl --output=kd_data.jsonl --tokenizer-path=./models/Teacher-8B --add-reasoning-content
 ```
 
 
