@@ -69,4 +69,7 @@ ray job submit --no-wait --address="http://127.0.0.1:8265" \
    --use_tensorboard $EXP_PATH/tensorboard \
    --dynamic_filtering \
    --dynamic_filtering_reward_range 0.01 0.99 \
-   --dynamic_filtering_min_diff 0
+   --dynamic_filtering_min_diff 0 \
+   --kd_kl_coef 0.0 \
+   --op_kl_coef 0.0 \
+   --ppo_coef 1.0
